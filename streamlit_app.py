@@ -5,411 +5,287 @@ import hmac
 import requests
 import struct
 import time
-from typing import Dict, Tuple, List, Optional
 
 # ============================================================================
 # CONSTANTS
 # ============================================================================
-CURVE_ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-CURVE_GX = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
-CURVE_GY = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
-
-BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-BECH32_ALPHABET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+ORDER = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+GX = 0x79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798
+GY = 0x483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+B32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
 # ============================================================================
-# BIP-39 WORDLIST
+# WORDLIST
 # ============================================================================
 @st.cache_data
-def load_wordlist():
-    url = "https://raw.githubusercontent.com/bitcoin/bips/master/bip-0039/english.txt"
-    response = requests.get(url, timeout=10)
-    words = response.text.strip().split("\n")
-    if len(words) != 2048:
-        st.error(f"Wordlist corrupted: {len(words)} words")
-        st.stop()
-    return words
+def load_words():
+    r = requests.get("https://raw.githubusercontent.com/bitcoin/bips/master/bip-0039/english.txt", timeout=10)
+    w = r.text.strip().split("\n")
+    if len(w) != 2048: st.error("Wordlist error"); st.stop()
+    return w
 
-WORDLIST = load_wordlist()
-WORD_TO_INDEX = {word: index for index, word in enumerate(WORDLIST)}
+WL = load_words()
+W2I = {w: i for i, w in enumerate(WL)}
 
 # ============================================================================
-# BIP-39 MNEMONIC
+# BIP-39
 # ============================================================================
-def generate_mnemonic(word_count: int = 12) -> str:
-    ENT = 128 if word_count == 12 else 256
-    CS = ENT // 32
-    entropy_bytes = secrets.token_bytes(ENT // 8)
-    entropy_hash = hashlib.sha256(entropy_bytes).digest()
-    checksum_value = entropy_hash[0] >> (8 - CS)
-    entropy_integer = int.from_bytes(entropy_bytes, 'big')
-    combined_bits = ENT + CS
-    combined_integer = (entropy_integer << CS) | checksum_value
-    
-    words = []
-    for i in range(word_count):
-        shift_amount = combined_bits - 11 * (i + 1)
-        word_index = (combined_integer >> shift_amount) & 0x7FF
-        words.append(WORDLIST[word_index])
-    
-    return ' '.join(words)
+def gen(wc=12):
+    ENT, CS = (128, 4) if wc == 12 else (256, 8)
+    e = secrets.token_bytes(ENT // 8)
+    h = hashlib.sha256(e).digest()
+    c = h[0] >> (8 - CS)
+    ei = int.from_bytes(e, 'big')
+    comb = (ei << CS) | c
+    return ' '.join(WL[(comb >> (ENT + CS - 11 * (i + 1))) & 0x7FF] for i in range(wc))
 
+def val(m):
+    ws = m.strip().split()
+    if len(ws) not in (12, 15, 18, 21, 24): return False
+    if not all(w in W2I for w in ws): return False
+    wc = len(ws)
+    ENT = (wc * 352) // 33
+    CS = wc * 11 - ENT
+    comb = 0
+    for idx in [W2I[w] for w in ws]: comb = (comb << 11) | idx
+    cs = comb & ((1 << CS) - 1)
+    eb = comb >> CS
+    try: eb_b = eb.to_bytes(ENT // 8, 'big')
+    except: return False
+    return cs == (hashlib.sha256(eb_b).digest()[0] >> (8 - CS))
 
-def validate_mnemonic(mnemonic: str) -> bool:
-    words = mnemonic.strip().split()
-    word_count = len(words)
-    
-    if word_count not in (12, 15, 18, 21, 24):
-        return False
-    
-    if not all(word in WORD_TO_INDEX for word in words):
-        return False
-    
-    total_bits = word_count * 11
-    ENT = (total_bits * 32) // 33
-    CS = total_bits - ENT
-    
-    indices = [WORD_TO_INDEX[word] for word in words]
-    combined_integer = 0
-    for index in indices:
-        combined_integer = (combined_integer << 11) | index
-    
-    extracted_checksum = combined_integer & ((1 << CS) - 1)
-    extracted_entropy = combined_integer >> CS
-    
-    try:
-        entropy_bytes = extracted_entropy.to_bytes(ENT // 8, 'big')
-    except (OverflowError, ValueError):
-        return False
-    
-    entropy_hash = hashlib.sha256(entropy_bytes).digest()
-    expected_checksum = entropy_hash[0] >> (8 - CS)
-    
-    return extracted_checksum == expected_checksum
-
-
-def mnemonic_to_seed(mnemonic: str, passphrase: str = "") -> bytes:
-    salt = ("mnemonic" + passphrase).encode('utf-8')
-    return hashlib.pbkdf2_hmac('sha512', mnemonic.encode('utf-8'), salt, 2048, 64)
+def seed(m, pw=""):
+    return hashlib.pbkdf2_hmac('sha512', m.encode(), ("mnemonic" + pw).encode(), 2048, 64)
 
 # ============================================================================
-# BIP-32 HD WALLET
+# BIP-32
 # ============================================================================
-def seed_to_master_keys(seed: bytes) -> Tuple[bytes, bytes]:
-    hmac_result = hmac.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
-    return hmac_result[:32], hmac_result[32:]
+def master(seed):
+    h = hmac.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
+    return h[:32], h[32:]
 
-
-def point_add(p1, p2):
+def padd(p1, p2):
     if p1 == (0, 0): return p2
     if p2 == (0, 0): return p1
-    x1, y1 = p1
-    x2, y2 = p2
+    x1, y1, x2, y2 = p1[0], p1[1], p2[0], p2[1]
     if x1 == x2:
         if y1 != y2: return (0, 0)
-        slope = (3 * x1 * x1 * pow(2 * y1, -1, CURVE_ORDER)) % CURVE_ORDER
-    else:
-        slope = ((y2 - y1) * pow(x2 - x1, -1, CURVE_ORDER)) % CURVE_ORDER
-    x3 = (slope * slope - x1 - x2) % CURVE_ORDER
-    y3 = (slope * (x1 - x3) - y1) % CURVE_ORDER
+        s = (3 * x1 * x1 * pow(2 * y1, -1, ORDER)) % ORDER
+    else: s = ((y2 - y1) * pow(x2 - x1, -1, ORDER)) % ORDER
+    x3 = (s * s - x1 - x2) % ORDER
+    y3 = (s * (x1 - x3) - y1) % ORDER
     return (x3, y3)
 
-
-def private_key_to_public_key(private_key_bytes: bytes, compressed: bool = True) -> Optional[bytes]:
-    k = int.from_bytes(private_key_bytes, 'big')
-    if k == 0 or k >= CURVE_ORDER: return None
-    
+def pub(k, comp=True):
+    ki = int.from_bytes(k, 'big')
+    if ki == 0 or ki >= ORDER: return None
     rx, ry = 0, 0
-    for bit in bin(k)[2:]:
-        if (rx, ry) != (0, 0):
-            rx, ry = point_add((rx, ry), (rx, ry))
-        if bit == '1':
-            if (rx, ry) == (0, 0):
-                rx, ry = CURVE_GX, CURVE_GY
-            else:
-                rx, ry = point_add((rx, ry), (CURVE_GX, CURVE_GY))
-    
-    if compressed:
-        prefix = 0x02 if (ry % 2 == 0) else 0x03
-        return bytes([prefix]) + rx.to_bytes(32, 'big')
+    for bit in bin(ki)[2:]:
+        if (rx, ry) != (0, 0): rx, ry = padd((rx, ry), (rx, ry))
+        if bit == '1': rx, ry = (GX, GY) if (rx, ry) == (0, 0) else padd((rx, ry), (GX, GY))
+    if comp: return bytes([0x02 if ry % 2 == 0 else 0x03]) + rx.to_bytes(32, 'big')
     return b'\x04' + rx.to_bytes(32, 'big') + ry.to_bytes(32, 'big')
 
+def ckd(k, c, idx):
+    data = (b'\x00' + k if idx >= 0x80000000 else pub(k, True)) + struct.pack('>I', idx)
+    h = hmac.new(c, data, hashlib.sha512).digest()
+    return ((int.from_bytes(h[:32], 'big') + int.from_bytes(k, 'big')) % ORDER).to_bytes(32, 'big'), h[32:]
 
-def derive_child_key(parent_key: bytes, parent_chain: bytes, child_index: int) -> Tuple[bytes, bytes]:
-    if child_index >= 0x80000000:
-        data = b'\x00' + parent_key + struct.pack('>I', child_index)
-    else:
-        parent_pub = private_key_to_public_key(parent_key, compressed=True)
-        data = parent_pub + struct.pack('>I', child_index)
-    
-    hmac_result = hmac.new(parent_chain, data, hashlib.sha512).digest()
-    left_bytes = hmac_result[:32]
-    right_bytes = hmac_result[32:]
-    
-    left_int = int.from_bytes(left_bytes, 'big')
-    parent_int = int.from_bytes(parent_key, 'big')
-    child_int = (left_int + parent_int) % CURVE_ORDER
-    
-    return child_int.to_bytes(32, 'big'), right_bytes
-
-
-def derive_key_from_path(seed: bytes, derivation_path: str) -> Optional[bytes]:
-    current_key, current_chain = seed_to_master_keys(seed)
-    
-    path_components = derivation_path.replace("m/", "").split("/")
-    
-    for component in path_components:
-        if not component: continue
-        
-        hardened = component.endswith("'")
-        index_str = component[:-1] if hardened else component
-        
-        try:
-            index = int(index_str)
-        except ValueError:
-            return None
-        
-        if hardened: index += 0x80000000
-        
-        current_key, current_chain = derive_child_key(current_key, current_chain, index)
-    
-    return current_key
+def derive(seed, path):
+    k, c = master(seed)
+    for part in path.replace("m/", "").split("/"):
+        if not part: continue
+        h = part.endswith("'")
+        idx = int(part[:-1]) + (0x80000000 if h else 0)
+        k, c = ckd(k, c, idx)
+    return k
 
 # ============================================================================
-# ADDRESS GENERATORS
+# ADDRESSES
 # ============================================================================
-def hash160(data: bytes) -> bytes:
-    return hashlib.new('ripemd160', hashlib.sha256(data).digest()).digest()
+def h160(d): return hashlib.new('ripemd160', hashlib.sha256(d).digest()).digest()
 
+def dsha(d): return hashlib.sha256(hashlib.sha256(d).digest()).digest()
 
-def double_sha256(data: bytes) -> bytes:
-    return hashlib.sha256(hashlib.sha256(data).digest()).digest()
-
-
-def base58_encode(data: bytes) -> str:
-    n = int.from_bytes(data, 'big')
-    result = []
-    while n > 0:
-        n, rem = divmod(n, 58)
-        result.append(BASE58_ALPHABET[rem])
-    for b in data:
-        if b == 0: result.append(BASE58_ALPHABET[0])
+def b58enc(d):
+    n = int.from_bytes(d, 'big')
+    r = []
+    while n: n, rem = divmod(n, 58); r.append(B58[rem])
+    for b in d:
+        if b == 0: r.append(B58[0])
         else: break
-    return ''.join(reversed(result))
+    return ''.join(reversed(r))
 
+def b58chk(pref, pay): return b58enc(pref + pay + dsha(pref + pay)[:4])
 
-def base58_check_encode(prefix: bytes, payload: bytes) -> str:
-    combined = prefix + payload
-    checksum = double_sha256(combined)[:4]
-    return base58_encode(combined + checksum)
-
-
-def bech32_hrp_expand(hrp: str) -> List[int]:
-    result = []
-    for c in hrp: result.append(ord(c) >> 5)
-    result.append(0)
-    for c in hrp: result.append(ord(c) & 31)
-    return result
-
-
-def bech32_polymod(values: List[int]) -> int:
+def b32poly(vals):
     gen = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
     chk = 1
-    for v in values:
-        top = chk >> 25
+    for v in vals:
+        b = chk >> 25
         chk = (chk & 0x1ffffff) << 5 ^ v
         for i in range(5):
-            if (top >> i) & 1: chk ^= gen[i]
+            if (b >> i) & 1: chk ^= gen[i]
     return chk
 
+def b32hrp(h): return [ord(x) >> 5 for x in h] + [0] + [ord(x) & 31 for x in h]
 
-def bech32_encode(hrp: str, witness_version: int, witness_program: bytes) -> str:
-    data = [witness_version] + list(witness_program)
-    values = bech32_hrp_expand(hrp) + data + [0, 0, 0, 0, 0, 0]
-    polymod = bech32_polymod(values) ^ 1
-    checksum = [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
-    combined = data + checksum
-    return hrp + '1' + ''.join(BECH32_ALPHABET[d] for d in combined)
+def b32enc(h, ver, prog):
+    data = [ver] + list(prog)
+    pm = b32poly(b32hrp(h) + data + [0, 0, 0, 0, 0, 0]) ^ 1
+    cs = [(pm >> 5 * (5 - i)) & 31 for i in range(6)]
+    return h + '1' + ''.join(B32[d] for d in data + cs)
 
+def btc_p2pkh(pub): return b58chk(b'\x00', h160(pub))
+def btc_p2sh(pub): return b58chk(b'\x05', h160(b'\x00\x14' + h160(pub)))
+def btc_b32(pub): return b32enc('bc', 0, h160(pub))
 
-def generate_bitcoin_p2pkh(public_key: bytes) -> str:
-    return base58_check_encode(b'\x00', hash160(public_key))
+def eth_addr(pub):
+    h = hashlib.sha256(pub[1:]).digest()[-20:]
+    ah = h.hex()
+    cs = hashlib.sha256(ah.encode()).hexdigest()
+    return '0x' + ''.join(c.upper() if int(cs[i], 16) >= 8 else c.lower() for i, c in enumerate(ah))
 
-
-def generate_bitcoin_p2sh_p2wpkh(public_key: bytes) -> str:
-    witness_program = b'\x00\x14' + hash160(public_key)
-    return base58_check_encode(b'\x05', hash160(witness_program))
-
-
-def generate_bitcoin_bech32(public_key: bytes) -> str:
-    return bech32_encode('bc', 0, hash160(public_key))
-
-
-def generate_ethereum_address(public_key_uncompressed: bytes) -> str:
-    pubkey_no_prefix = public_key_uncompressed[1:]
-    keccak_hash = hashlib.sha256(pubkey_no_prefix).digest()
-    address_bytes = keccak_hash[-20:]
-    address_hex = address_bytes.hex()
-    checksum_input = hashlib.sha256(address_hex.encode()).hexdigest()
-    result = '0x'
-    for i, char in enumerate(address_hex):
-        if int(checksum_input[i], 16) >= 8: result += char.upper()
-        else: result += char.lower()
-    return result
-
-
-def generate_litecoin_p2pkh(public_key: bytes) -> str:
-    return base58_check_encode(b'\x30', hash160(public_key))
-
-
-def generate_litecoin_p2sh_p2wpkh(public_key: bytes) -> str:
-    witness_program = b'\x00\x14' + hash160(public_key)
-    return base58_check_encode(b'\x32', hash160(witness_program))
-
-
-def generate_dogecoin_p2pkh(public_key: bytes) -> str:
-    return base58_check_encode(b'\x1e', hash160(public_key))
+def ltc_p2pkh(pub): return b58chk(b'\x30', h160(pub))
+def ltc_p2sh(pub): return b58chk(b'\x32', h160(b'\x00\x14' + h160(pub)))
+def doge_p2pkh(pub): return b58chk(b'\x1e', h160(pub))
 
 # ============================================================================
-# DERIVATION PATHS
+# PATHS
 # ============================================================================
-DERIVATION_PATHS = {
-    "BTC Legacy":         ("m/44'/0'/0'/0/0", "BTC_P2PKH"),
-    "BTC SegWit":         ("m/49'/0'/0'/0/0", "BTC_P2SH"),
-    "BTC Native SegWit":  ("m/84'/0'/0'/0/0", "BTC_BECH32"),
-    "Ethereum":           ("m/44'/60'/0'/0/0", "EVM"),
-    "BNB Smart Chain":    ("m/44'/60'/0'/0/0", "EVM"),
-    "Polygon":            ("m/44'/60'/0'/0/0", "EVM"),
-    "Avalanche C-Chain":  ("m/44'/60'/0'/0/0", "EVM"),
-    "Fantom":             ("m/44'/60'/0'/0/0", "EVM"),
-    "Arbitrum":           ("m/44'/60'/0'/0/0", "EVM"),
-    "Optimism":           ("m/44'/60'/0'/0/0", "EVM"),
-    "Base":               ("m/44'/60'/0'/0/0", "EVM"),
-    "TRON":               ("m/44'/195'/0'/0/0", "EVM"),
-    "Litecoin Legacy":    ("m/44'/2'/0'/0/0", "LTC_P2PKH"),
-    "Litecoin SegWit":    ("m/49'/2'/0'/0/0", "LTC_P2SH"),
-    "Dogecoin":           ("m/44'/3'/0'/0/0", "DOGE"),
+PATHS = {
+    "BTC Legacy": ("m/44'/0'/0'/0/0", 'BTC'),
+    "BTC SegWit": ("m/49'/0'/0'/0/0", 'BTC'),
+    "BTC Native": ("m/84'/0'/0'/0/0", 'BTC'),
+    "Ethereum": ("m/44'/60'/0'/0/0", 'EVM'),
+    "BNB Chain": ("m/44'/60'/0'/0/0", 'EVM'),
+    "Polygon": ("m/44'/60'/0'/0/0", 'EVM'),
+    "Avalanche": ("m/44'/60'/0'/0/0", 'EVM'),
+    "Fantom": ("m/44'/60'/0'/0/0", 'EVM'),
+    "Arbitrum": ("m/44'/60'/0'/0/0", 'EVM'),
+    "Optimism": ("m/44'/60'/0'/0/0", 'EVM'),
+    "Base": ("m/44'/60'/0'/0/0", 'EVM'),
+    "TRON": ("m/44'/195'/0'/0/0", 'EVM'),
+    "LTC Legacy": ("m/44'/2'/0'/0/0", 'LTC'),
+    "LTC SegWit": ("m/49'/2'/0'/0/0", 'LTC'),
+    "Dogecoin": ("m/44'/3'/0'/0/0", 'DOGE'),
+}
+
+APIS = {
+    'Ethereum': 'https://api.etherscan.io/api',
+    'BNB Chain': 'https://api.bscscan.com/api',
+    'Polygon': 'https://api.polygonscan.com/api',
+    'Avalanche': 'https://api.snowtrace.io/api',
+    'Fantom': 'https://api.ftmscan.com/api',
+    'Arbitrum': 'https://api.arbiscan.io/api',
+    'Optimism': 'https://api-optimistic.etherscan.io/api',
+    'Base': 'https://api.basescan.org/api',
 }
 
 # ============================================================================
 # SCANNERS
 # ============================================================================
-def fetch_bitcoin_balance(address: str) -> float:
+def bal_btc(a):
     try:
-        url = f"https://blockstream.info/api/address/{address}"
-        response = requests.get(url, timeout=8)
-        if response.status_code == 200:
-            data = response.json()
-            cs = data.get('chain_stats', {})
-            ms = data.get('mempool_stats', {})
-            funded = cs.get('funded_txo_sum', 0) + ms.get('funded_txo_sum', 0)
-            spent = cs.get('spent_txo_sum', 0) + ms.get('spent_txo_sum', 0)
-            return (funded - spent) / 1e8
-    except Exception: pass
+        r = requests.get(f"https://blockstream.info/api/address/{a}", timeout=5)
+        if r.status_code == 200:
+            d = r.json()
+            cs = d.get('chain_stats', {})
+            ms = d.get('mempool_stats', {})
+            return ((cs.get('funded_txo_sum', 0) + ms.get('funded_txo_sum', 0)) -
+                    (cs.get('spent_txo_sum', 0) + ms.get('spent_txo_sum', 0))) / 1e8
+    except: pass
     return 0.0
 
-
-def fetch_evm_balance(address: str, api_url: str) -> float:
+def bal_evm(a, api):
     try:
-        params = {'module': 'account', 'action': 'balance', 'address': address, 'tag': 'latest'}
-        response = requests.get(api_url, params=params, timeout=8)
-        data = response.json()
-        if data.get('status') == '1': return int(data.get('result', '0')) / 1e18
-    except Exception: pass
+        r = requests.get(f"{api}?module=account&action=balance&address={a}&tag=latest", timeout=5)
+        d = r.json()
+        if d.get('status') == '1': return int(d.get('result', '0')) / 1e18
+    except: pass
     return 0.0
 
-
-def fetch_litecoin_balance(address: str) -> float:
+def bal_ltc(a):
     try:
-        url = f"https://api.blockcypher.com/v1/ltc/main/addrs/{address}/balance"
-        response = requests.get(url, timeout=8)
-        return response.json().get('final_balance', 0) / 1e8
-    except Exception: pass
+        r = requests.get(f"https://api.blockcypher.com/v1/ltc/main/addrs/{a}/balance", timeout=5)
+        return r.json().get('final_balance', 0) / 1e8
+    except: pass
     return 0.0
 
-
-def fetch_dogecoin_balance(address: str) -> float:
+def bal_doge(a):
     try:
-        url = f"https://api.blockcypher.com/v1/doge/main/addrs/{address}/balance"
-        response = requests.get(url, timeout=8)
-        return response.json().get('final_balance', 0) / 1e8
-    except Exception: pass
+        r = requests.get(f"https://api.blockcypher.com/v1/doge/main/addrs/{a}/balance", timeout=5)
+        return r.json().get('final_balance', 0) / 1e8
+    except: pass
     return 0.0
 
-
-def fetch_tron_balance(address: str) -> float:
+def bal_trx(a):
     try:
-        url = f"https://apilist.tronscanapi.com/api/accountv2?address={address}"
-        response = requests.get(url, timeout=8)
-        return response.json().get('balance', 0) / 1e6
-    except Exception: pass
+        r = requests.get(f"https://apilist.tronscanapi.com/api/accountv2?address={a}", timeout=5)
+        return r.json().get('balance', 0) / 1e6
+    except: pass
     return 0.0
 
 # ============================================================================
-# FULL WALLET DERIVATION
+# FULL WALLET
 # ============================================================================
-def derive_full_wallet(mnemonic: str) -> Tuple[Dict, bytes, bytes]:
-    seed = mnemonic_to_seed(mnemonic)
-    master_key, master_chain = seed_to_master_keys(seed)
-    
+def full_wallet(m):
+    s = seed(m)
+    mk, mc = master(s)
     wallets = {}
     
-    for name, (path, addr_type) in DERIVATION_PATHS.items():
-        private_key = derive_key_from_path(seed, path)
-        
-        if private_key is None:
+    for name, (path, typ) in PATHS.items():
+        priv = derive(s, path)
+        if not priv:
             wallets[name] = {'error': 'derivation failed'}
             continue
         
-        public_key_compressed = private_key_to_public_key(private_key, compressed=True)
-        public_key_uncompressed = private_key_to_public_key(private_key, compressed=False)
+        pub_c = pub(priv, True)
+        pub_u = pub(priv, False)
         
-        if public_key_compressed is None or public_key_uncompressed is None:
+        if not pub_c or not pub_u:
             wallets[name] = {'error': 'pubkey failed'}
             continue
         
-        if addr_type == 'BTC_P2PKH':
-            wallets[name] = {'address': generate_bitcoin_p2pkh(public_key_compressed), 'type': 'BTC'}
-        elif addr_type == 'BTC_P2SH':
-            wallets[name] = {'address': generate_bitcoin_p2sh_p2wpkh(public_key_compressed), 'type': 'BTC'}
-        elif addr_type == 'BTC_BECH32':
-            wallets[name] = {'address': generate_bitcoin_bech32(public_key_compressed), 'type': 'BTC'}
-        elif addr_type == 'EVM':
-            wallets[name] = {'address': generate_ethereum_address(public_key_uncompressed), 'type': 'EVM'}
-        elif addr_type == 'LTC_P2PKH':
-            wallets[name] = {'address': generate_litecoin_p2pkh(public_key_compressed), 'type': 'LTC'}
-        elif addr_type == 'LTC_P2SH':
-            wallets[name] = {'address': generate_litecoin_p2sh_p2wpkh(public_key_compressed), 'type': 'LTC'}
-        elif addr_type == 'DOGE':
-            wallets[name] = {'address': generate_dogecoin_p2pkh(public_key_compressed), 'type': 'DOGE'}
+        if typ == 'BTC':
+            if 'Legacy' in name: wallets[name] = {'addr': btc_p2pkh(pub_c), 'type': 'BTC'}
+            elif 'SegWit' in name and 'Native' not in name: wallets[name] = {'addr': btc_p2sh(pub_c), 'type': 'BTC'}
+            else: wallets[name] = {'addr': btc_b32(pub_c), 'type': 'BTC'}
+        elif typ == 'EVM':
+            wallets[name] = {'addr': eth_addr(pub_u), 'type': 'EVM'}
+        elif typ == 'LTC':
+            if 'Legacy' in name: wallets[name] = {'addr': ltc_p2pkh(pub_c), 'type': 'LTC'}
+            else: wallets[name] = {'addr': ltc_p2sh(pub_c), 'type': 'LTC'}
+        elif typ == 'DOGE':
+            wallets[name] = {'addr': doge_p2pkh(pub_c), 'type': 'DOGE'}
     
-    return wallets, master_key, master_chain
+    return wallets, mk, mc
 
 # ============================================================================
 # UI
 # ============================================================================
 st.set_page_config(page_title="HD Key Hunter", page_icon="K")
 st.title("HD Key Hunter")
-st.subheader("BIP-39 / BIP-32 / BIP-44 Full Standard Derivation")
-st.caption("Addresses match MetaMask, TrustWallet, Ledger, Trezor, Exodus")
+st.subheader("BIP-39 / BIP-32 / BIP-44 Full Standard")
+st.caption("Matches MetaMask, TrustWallet, Ledger, Trezor")
 
-tab1, tab2 = st.tabs(["Generate & Scan", "Deep Scan"])
+t1, t2 = st.tabs(["Generate & Scan", "Deep Scan"])
 
-with tab1:
+with t1:
     c1, c2 = st.columns(2)
     with c1: n = st.slider("Phrases", 1, 5, 1)
     with c2: wc = st.radio("Words", [12, 24], horizontal=True)
     
-    if st.button("Generate + Scan All Chains", type="primary", use_container_width=True):
+    if st.button("Generate + Scan", type="primary", use_container_width=True):
         for _ in range(n):
-            phrase = generate_mnemonic(wc)
+            phrase = gen(wc)
             st.markdown("---")
             st.code(phrase)
             
-            wallets, mk, mc = derive_full_wallet(phrase)
+            wallets, mk, mc = full_wallet(phrase)
             st.text(f"Master Key: {mk.hex()}")
             st.text(f"Chain Code: {mc.hex()}")
-            st.text(f"15 Addresses:")
             
             found = False
             for name, data in wallets.items():
@@ -417,45 +293,36 @@ with tab1:
                     st.text(f"  {name}: {data['error']}")
                     continue
                 
-                addr = data['address']
-                t = data['type']
+                a, t = data['addr'], data['type']
                 
-                if t in ('BTC',): bal = fetch_bitcoin_balance(addr); sym = 'BTC'
-                elif t == 'LTC': bal = fetch_litecoin_balance(addr); sym = 'LTC'
-                elif t == 'DOGE': bal = fetch_dogecoin_balance(addr); sym = 'DOGE'
+                if t == 'BTC': bal = bal_btc(a); sym = 'BTC'
+                elif t == 'LTC': bal = bal_ltc(a); sym = 'LTC'
+                elif t == 'DOGE': bal = bal_doge(a); sym = 'DOGE'
                 elif t == 'EVM':
-                    if name == 'TRON': bal = fetch_tron_balance(addr); sym = 'TRX'
-                    elif name == 'Ethereum': bal = fetch_evm_balance(addr, 'https://api.etherscan.io/api'); sym = 'ETH'
-                    elif name == 'BNB Smart Chain': bal = fetch_evm_balance(addr, 'https://api.bscscan.com/api'); sym = 'BNB'
-                    elif name == 'Polygon': bal = fetch_evm_balance(addr, 'https://api.polygonscan.com/api'); sym = 'MATIC'
-                    elif name == 'Avalanche C-Chain': bal = fetch_evm_balance(addr, 'https://api.snowtrace.io/api'); sym = 'AVAX'
-                    elif name == 'Fantom': bal = fetch_evm_balance(addr, 'https://api.ftmscan.com/api'); sym = 'FTM'
-                    elif name == 'Arbitrum': bal = fetch_evm_balance(addr, 'https://api.arbiscan.io/api'); sym = 'ETH'
-                    elif name == 'Optimism': bal = fetch_evm_balance(addr, 'https://api-optimistic.etherscan.io/api'); sym = 'ETH'
-                    elif name == 'Base': bal = fetch_evm_balance(addr, 'https://api.basescan.org/api'); sym = 'ETH'
+                    if name == 'TRON': bal = bal_trx(a); sym = 'TRX'
+                    elif name in APIS: bal = bal_evm(a, APIS[name]); sym = 'ETH'
                     else: bal = 0.0; sym = '?'
                 else: bal = 0.0; sym = '?'
                 
                 if bal > 0:
                     found = True
-                    st.success(f"  FOUND {name}: {bal:.8f} {sym} - {addr}")
+                    st.success(f"FOUND {name}: {bal:.8f} {sym} - {a}")
                 else:
                     st.text(f"  {name}: 0 {sym}")
                 
                 time.sleep(0.02)
             
             if found: st.balloons()
-            else: st.warning("All 15 addresses: zero balance")
+            else: st.warning("All 15: zero balance")
 
-with tab2:
-    phrase = st.text_area("Enter BIP-39 phrase:", height=80)
+with t2:
+    phrase = st.text_area("Enter phrase:", height=80)
     
-    if st.button("Full HD Scan", type="primary", use_container_width=True):
+    if st.button("Full Scan", type="primary", use_container_width=True):
         if phrase.strip():
-            if not validate_mnemonic(phrase.strip()):
-                st.error("Invalid checksum")
+            if not val(phrase.strip()): st.error("Invalid checksum")
             else:
-                wallets, mk, mc = derive_full_wallet(phrase.strip())
+                wallets, mk, mc = full_wallet(phrase.strip())
                 st.code(f"Master Key: {mk.hex()}\nChain Code: {mc.hex()}")
                 
                 for name, data in wallets.items():
@@ -463,30 +330,20 @@ with tab2:
                         st.text(f"{name}: {data['error']}")
                         continue
                     
-                    addr = data['address']
-                    t = data['type']
+                    a, t = data['addr'], data['type']
                     
-                    if t in ('BTC',): bal = fetch_bitcoin_balance(addr); sym = 'BTC'
-                    elif t == 'LTC': bal = fetch_litecoin_balance(addr); sym = 'LTC'
-                    elif t == 'DOGE': bal = fetch_dogecoin_balance(addr); sym = 'DOGE'
+                    if t == 'BTC': bal = bal_btc(a); sym = 'BTC'
+                    elif t == 'LTC': bal = bal_ltc(a); sym = 'LTC'
+                    elif t == 'DOGE': bal = bal_doge(a); sym = 'DOGE'
                     elif t == 'EVM':
-                        if name == 'TRON': bal = fetch_tron_balance(addr); sym = 'TRX'
-                        elif name == 'Ethereum': bal = fetch_evm_balance(addr, 'https://api.etherscan.io/api'); sym = 'ETH'
-                        elif name == 'BNB Smart Chain': bal = fetch_evm_balance(addr, 'https://api.bscscan.com/api'); sym = 'BNB'
-                        elif name == 'Polygon': bal = fetch_evm_balance(addr, 'https://api.polygonscan.com/api'); sym = 'MATIC'
-                        elif name == 'Avalanche C-Chain': bal = fetch_evm_balance(addr, 'https://api.snowtrace.io/api'); sym = 'AVAX'
-                        elif name == 'Fantom': bal = fetch_evm_balance(addr, 'https://api.ftmscan.com/api'); sym = 'FTM'
-                        elif name == 'Arbitrum': bal = fetch_evm_balance(addr, 'https://api.arbiscan.io/api'); sym = 'ETH'
-                        elif name == 'Optimism': bal = fetch_evm_balance(addr, 'https://api-optimistic.etherscan.io/api'); sym = 'ETH'
-                        elif name == 'Base': bal = fetch_evm_balance(addr, 'https://api.basescan.org/api'); sym = 'ETH'
+                        if name == 'TRON': bal = bal_trx(a); sym = 'TRX'
+                        elif name in APIS: bal = bal_evm(a, APIS[name]); sym = 'ETH'
                         else: bal = 0.0; sym = '?'
                     else: bal = 0.0; sym = '?'
                     
-                    if bal > 0:
-                        st.success(f"FOUND {name}: {bal:.8f} {sym} - {addr}")
-                    else:
-                        st.text(f"{name}: 0 {sym}")
+                    if bal > 0: st.success(f"FOUND {name}: {bal:.8f} {sym} - {a}")
+                    else: st.text(f"{name}: 0 {sym}")
                     
                     time.sleep(0.02)
 
-st.caption("BIP-39/32/44 standard | 15 addresses | 13 chains")
+st.caption("BIP-39/32/44 | 15 paths | 13 chains")
