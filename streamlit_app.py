@@ -22,9 +22,6 @@ def load_words():
 WL = load_words()
 W2I = {w: i for i, w in enumerate(WL)}
 
-# ============================================================================
-# BIP-39
-# ============================================================================
 def gen(wc=12):
     ENT, CS = (128, 4) if wc == 12 else (256, 8)
     e = secrets.token_bytes(ENT // 8)
@@ -53,7 +50,7 @@ def seed(m, pw=""):
     return hashlib.pbkdf2_hmac('sha512', m.encode(), ("mnemonic" + pw).encode(), 2048, 64)
 
 # ============================================================================
-# BIP-32 - CKDpriv with path string safety
+# BIP-32
 # ============================================================================
 def master(seed_bytes):
     h = hmac.new(b"Bitcoin seed", seed_bytes, hashlib.sha512).digest()
@@ -87,35 +84,29 @@ def ckd(k, c, idx):
     return ((int.from_bytes(h[:32], 'big') + int.from_bytes(k, 'big')) % ORDER).to_bytes(32, 'big'), h[32:]
 
 def parse_path(path_str):
-    """Parse BIP-32 path safely, returning list of integer indices."""
     cleaned = path_str.strip()
-    if cleaned.lower().startswith("m/"):
-        cleaned = cleaned[2:]
+    if cleaned.lower().startswith("m/"): cleaned = cleaned[2:]
     parts = [p.strip() for p in cleaned.split("/") if p.strip()]
     indices = []
     for part in parts:
         hardened = part.endswith("'") or part.endswith("h") or part.endswith("H")
         num_str = part.rstrip("'hH")
-        try:
-            num = int(num_str)
-        except ValueError:
-            return None
-        if hardened:
-            num += 0x80000000
+        if not num_str: return None
+        try: num = int(num_str)
+        except ValueError: return None
+        if hardened: num += 0x80000000
         indices.append(num)
     return indices
 
 def derive(seed_bytes, path_str):
     indices = parse_path(path_str)
-    if indices is None:
-        return None
+    if indices is None: return None
     k, c = master(seed_bytes)
-    for idx in indices:
-        k, c = ckd(k, c, idx)
+    for idx in indices: k, c = ckd(k, c, idx)
     return k
 
 # ============================================================================
-# ADDRESSES
+# ADDRESSES - FIXED BECH32
 # ============================================================================
 def h160(d): return hashlib.new('ripemd160', hashlib.sha256(d).digest()).digest()
 def dsha(d): return hashlib.sha256(hashlib.sha256(d).digest()).digest()
@@ -129,39 +120,52 @@ def b58enc(d):
         else: break
     return ''.join(reversed(r))
 
-def b58chk(pref, pay): return b58enc(pref + pay + dsha(pref + pay)[:4])
+def b58chk(pref, pay):
+    combined = pref + pay
+    return b58enc(combined + dsha(combined)[:4])
 
-def b32poly(vals):
-    gen = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
+def bech32_polymod(values):
+    GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
     chk = 1
-    for v in vals:
+    for v in values:
         b = chk >> 25
         chk = (chk & 0x1ffffff) << 5 ^ v
         for i in range(5):
-            if (b >> i) & 1: chk ^= gen[i]
+            if (b >> i) & 1: chk ^= GEN[i]
     return chk
 
-def b32hrp(h): return [ord(x) >> 5 for x in h] + [0] + [ord(x) & 31 for x in h]
+def bech32_hrp_expand(hrp):
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
 
-def b32enc(h, ver, prog):
-    data = [ver] + list(prog)
-    pm = b32poly(b32hrp(h) + data + [0, 0, 0, 0, 0, 0]) ^ 1
-    cs = [(pm >> 5 * (5 - i)) & 31 for i in range(6)]
-    return h + '1' + ''.join(B32[d] for d in data + cs)
+def bech32_verify_checksum(hrp, data):
+    return bech32_polymod(bech32_hrp_expand(hrp) + data) == 1
 
-def btc_p2pkh(pub): return b58chk(b'\x00', h160(pub))
-def btc_p2sh(pub): return b58chk(b'\x05', h160(b'\x00\x14' + h160(pub)))
-def btc_b32(pub): return b32enc('bc', 0, h160(pub))
+def bech32_create_checksum(hrp, data):
+    values = bech32_hrp_expand(hrp) + data
+    polymod = bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ 1
+    return [(polymod >> 5 * (5 - i)) & 31 for i in range(6)]
 
-def eth_addr(pub):
-    h = hashlib.sha256(pub[1:]).digest()[-20:]
+def bech32_encode(hrp, witver, witprog):
+    data = [witver]
+    for b in witprog:
+        data.append(b)
+    checksum = bech32_create_checksum(hrp, data)
+    combined = data + checksum
+    return hrp + '1' + ''.join(B32[d] for d in combined)
+
+def btc_p2pkh(pubk): return b58chk(b'\x00', h160(pubk))
+def btc_p2sh(pubk): return b58chk(b'\x05', h160(b'\x00\x14' + h160(pubk)))
+def btc_b32(pubk): return bech32_encode('bc', 0, h160(pubk))
+
+def eth_addr(pubk):
+    h = hashlib.sha256(pubk[1:]).digest()[-20:]
     ah = h.hex()
     cs = hashlib.sha256(ah.encode()).hexdigest()
     return '0x' + ''.join(c.upper() if int(cs[i], 16) >= 8 else c.lower() for i, c in enumerate(ah))
 
-def ltc_p2pkh(pub): return b58chk(b'\x30', h160(pub))
-def ltc_p2sh(pub): return b58chk(b'\x32', h160(b'\x00\x14' + h160(pub)))
-def doge_p2pkh(pub): return b58chk(b'\x1e', h160(pub))
+def ltc_p2pkh(pubk): return b58chk(b'\x30', h160(pubk))
+def ltc_p2sh(pubk): return b58chk(b'\x32', h160(b'\x00\x14' + h160(pubk)))
+def doge_p2pkh(pubk): return b58chk(b'\x1e', h160(pubk))
 
 # ============================================================================
 # PATHS
