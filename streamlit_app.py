@@ -5,7 +5,11 @@ import hmac
 import requests
 import json
 import time
+from typing import Dict, Optional
 
+# ============================================================================
+# BIP-39 WORDLIST
+# ============================================================================
 @st.cache_data
 def load_words():
     r = requests.get("https://raw.githubusercontent.com/bitcoin/bips/master/bip-0039/english.txt")
@@ -13,13 +17,15 @@ def load_words():
     return words
 
 BIP39 = load_words()
-
 if len(BIP39) != 2048:
     st.error("Failed to load wordlist")
     st.stop()
 
 W2I = {w: i for i, w in enumerate(BIP39)}
 
+# ============================================================================
+# CORE FUNCTIONS
+# ============================================================================
 def gen(wc=12):
     ENT = {12: 128, 24: 256}[wc]
     CS = ENT // 32
@@ -61,172 +67,232 @@ def seed(m, pw=""):
 def master_key(seed_bytes):
     return hmac.new(b"Bitcoin seed", seed_bytes, hashlib.sha512).digest()[:32]
 
-def derive_public_key(priv_key_bytes):
+# ============================================================================
+# ADDRESS GENERATORS - ALL CHAINS
+# ============================================================================
+def priv_to_eth_address(priv):
+    try:
+        from eth_keys import keys
+        pk = keys.PrivateKey(priv)
+        return pk.public_key.to_checksum_address()
+    except:
+        return None
+
+def priv_to_btc_addresses(priv):
     try:
         from coincurve import PrivateKey
-        pk = PrivateKey(priv_key_bytes)
-        return pk.public_key.format()
-    except:
-        return None
-
-def pubkey_to_addresses(pubkey_bytes):
-    addresses = {}
-    
-    try:
-        # P2PKH (Legacy - starts with 1)
-        h1 = hashlib.sha256(pubkey_bytes).digest()
+        pk = PrivateKey(priv)
+        pub = pk.public_key.format()
+        h1 = hashlib.sha256(pub).digest()
         h2 = hashlib.new('ripemd160', h1).digest()
-        addresses['legacy'] = base58_encode_p2pkh(h2)
+        return {'BTC': base58_encode(b'\x00' + h2)}
     except:
-        pass
-    
-    try:
-        # P2SH-SegWit (starts with 3)
-        script = b'\x00\x14' + hashlib.new('ripemd160', hashlib.sha256(pubkey_bytes).digest()).digest()
-        h3 = hashlib.sha256(script).digest()
-        h4 = hashlib.new('ripemd160', h3).digest()
-        addresses['segwit'] = base58_encode_p2sh(h4)
-    except:
-        pass
-    
-    try:
-        # Bech32 Native SegWit (starts with bc1)
-        witprog = hashlib.new('ripemd160', hashlib.sha256(pubkey_bytes).digest()).digest()
-        addresses['native'] = bech32_encode('bc', 0, witprog)
-    except:
-        pass
-    
-    return addresses
+        return {}
 
-def base58_encode_p2pkh(hash160):
-    prefix = b'\x00' + hash160
-    checksum = hashlib.sha256(hashlib.sha256(prefix).digest()).digest()[:4]
-    return base58_encode(prefix + checksum)
-
-def base58_encode_p2sh(hash160):
-    prefix = b'\x05' + hash160
-    checksum = hashlib.sha256(hashlib.sha256(prefix).digest()).digest()[:4]
-    return base58_encode(prefix + checksum)
-
-BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
-
+BASE58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
 def base58_encode(data):
     n = int.from_bytes(data, 'big')
-    result = []
+    res = []
     while n > 0:
         n, rem = divmod(n, 58)
-        result.append(BASE58_ALPHABET[rem])
-    for byte in data:
-        if byte == 0:
-            result.append(BASE58_ALPHABET[0])
+        res.append(BASE58[rem])
+    for b in data:
+        if b == 0:
+            res.append(BASE58[0])
         else:
             break
-    return ''.join(reversed(result))
-
-def bech32_encode(hrp, witver, witprog):
-    CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l'
-    GENERATOR = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3]
-    
-    def polymod(values):
-        chk = 1
-        for v in values:
-            top = chk >> 25
-            chk = (chk & 0x1ffffff) << 5 ^ v
-            for i in range(5):
-                if (top >> i) & 1:
-                    chk ^= GENERATOR[i]
-        return chk
-    
-    def hrp_expand(s):
-        return [ord(x) >> 5 for x in s] + [0] + [ord(x) & 31 for x in s]
-    
-    data = [witver] + list(witprog)
-    combined = hrp_expand(hrp) + data
-    plm = polymod(combined + [0, 0, 0, 0, 0, 0])
-    checksum = [(plm >> 5 * (5 - i)) & 31 for i in range(6)]
-    return hrp + '1' + ''.join(CHARSET[d] for d in data + checksum)
+    return ''.join(reversed(res))
 
 # ============================================================================
-# UTXO SCANNER - Multi-API Strategy
+# MULTI-CHAIN BALANCE CHECKERS
 # ============================================================================
-
-def check_balance_blockchain_info(address):
+def check_btc(addr):
     try:
-        resp = requests.get(f"https://blockchain.info/balance?active={address}", timeout=5)
-        data = resp.json()
-        return data.get(address, {}).get('final_balance', 0) / 1e8
-    except:
-        return None
-
-def check_balance_blockstream(address):
-    try:
-        resp = requests.get(f"https://blockstream.info/api/address/{address}", timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            chain_stats = data.get('chain_stats', {})
-            mempool_stats = data.get('mempool_stats', {})
-            funded = chain_stats.get('funded_txo_sum', 0)
-            spent = chain_stats.get('spent_txo_sum', 0)
-            balance = (funded - spent) / 1e8
-            return balance
+        r = requests.get(f"https://blockstream.info/api/address/{addr}", timeout=5)
+        if r.status_code == 200:
+            d = r.json()
+            cs = d.get('chain_stats', {})
+            ms = d.get('mempool_stats', {})
+            funded = cs.get('funded_txo_sum', 0) + ms.get('funded_txo_sum', 0)
+            spent = cs.get('spent_txo_sum', 0) + ms.get('spent_txo_sum', 0)
+            return (funded - spent) / 1e8
     except:
         pass
-    return None
+    return 0.0
 
-def check_balance_mempool(address):
-    try:
-        resp = requests.get(f"https://mempool.space/api/address/{address}", timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            chain_stats = data.get('chain_stats', {})
-            mempool_stats = data.get('mempool_stats', {})
-            funded = chain_stats.get('funded_txo_sum', 0) + mempool_stats.get('funded_txo_sum', 0)
-            spent = chain_stats.get('spent_txo_sum', 0) + mempool_stats.get('spent_txo_sum', 0)
-            balance = (funded - spent) / 1e8
-            return balance
-    except:
-        pass
-    return None
-
-def check_balance_btcscan(address):
-    try:
-        resp = requests.get(f"https://btcscan.org/api/address/{address}", timeout=5)
-        if resp.status_code == 200:
-            data = resp.json()
-            chain_stats = data.get('chain_stats', {})
-            funded = chain_stats.get('funded_txo_sum', 0)
-            spent = chain_stats.get('spent_txo_sum', 0)
-            balance = (funded - spent) / 1e8
-            return balance
-    except:
-        pass
-    return None
-
-def scan_address_full(address):
-    """Try all APIs - return balance if any finds funds"""
-    checkers = [
-        check_balance_blockstream,
-        check_balance_mempool,
-        check_balance_blockchain_info,
-        check_balance_btcscan,
+def check_eth(addr):
+    apis = [
+        f"https://api.etherscan.io/api?module=account&action=balance&address={addr}&tag=latest",
+        f"https://eth.llamarpc.com",
     ]
-    
-    for checker in checkers:
-        result = checker(address)
-        if result is not None:
-            return result
-    
+    try:
+        r = requests.get(apis[0], timeout=5)
+        d = r.json()
+        if d.get('status') == '1':
+            return int(d.get('result', 0)) / 1e18
+    except:
+        pass
+    return 0.0
+
+def check_bsc(addr):
+    try:
+        r = requests.get(f"https://api.bscscan.com/api?module=account&action=balance&address={addr}&tag=latest", timeout=5)
+        d = r.json()
+        if d.get('status') == '1':
+            return int(d.get('result', 0)) / 1e18
+    except:
+        pass
+    return 0.0
+
+def check_polygon(addr):
+    try:
+        r = requests.get(f"https://api.polygonscan.com/api?module=account&action=balance&address={addr}&tag=latest", timeout=5)
+        d = r.json()
+        if d.get('status') == '1':
+            return int(d.get('result', 0)) / 1e18
+    except:
+        pass
+    return 0.0
+
+def check_avax(addr):
+    try:
+        r = requests.get(f"https://api.routescan.io/v2/network/mainnet/evm/43114/etherscan/api?module=account&action=balance&address={addr}", timeout=5)
+        d = r.json()
+        if d.get('status') == '1':
+            return int(d.get('result', 0)) / 1e18
+    except:
+        pass
+    return 0.0
+
+def check_ftm(addr):
+    try:
+        r = requests.get(f"https://api.ftmscan.com/api?module=account&action=balance&address={addr}&tag=latest", timeout=5)
+        d = r.json()
+        if d.get('status') == '1':
+            return int(d.get('result', 0)) / 1e18
+    except:
+        pass
+    return 0.0
+
+def check_arb(addr):
+    try:
+        r = requests.get(f"https://api.arbiscan.io/api?module=account&action=balance&address={addr}&tag=latest", timeout=5)
+        d = r.json()
+        if d.get('status') == '1':
+            return int(d.get('result', 0)) / 1e18
+    except:
+        pass
+    return 0.0
+
+def check_op(addr):
+    try:
+        r = requests.get(f"https://api-optimistic.etherscan.io/api?module=account&action=balance&address={addr}&tag=latest", timeout=5)
+        d = r.json()
+        if d.get('status') == '1':
+            return int(d.get('result', 0)) / 1e18
+    except:
+        pass
+    return 0.0
+
+def check_base(addr):
+    try:
+        r = requests.get(f"https://api.basescan.org/api?module=account&action=balance&address={addr}&tag=latest", timeout=5)
+        d = r.json()
+        if d.get('status') == '1':
+            return int(d.get('result', 0)) / 1e18
+    except:
+        pass
+    return 0.0
+
+def check_trx(addr):
+    try:
+        r = requests.get(f"https://apilist.tronscanapi.com/api/accountv2?address={addr}", timeout=5)
+        d = r.json()
+        return d.get('balance', 0) / 1e6
+    except:
+        pass
+    return 0.0
+
+def check_doge(addr):
+    try:
+        r = requests.get(f"https://dogechain.info/api/v1/address/balance/{addr}", timeout=5)
+        d = r.json()
+        return float(d.get('balance', 0))
+    except:
+        pass
+    return 0.0
+
+def check_ltc(addr):
+    try:
+        r = requests.get(f"https://blockchair.com/api/address/ltc/{addr}", timeout=5)
+        d = r.json()
+        return d.get('data', {}).get(addr, {}).get('address', {}).get('balance', 0) / 1e8
+    except:
+        pass
+    return 0.0
+
+def check_sol(addr):
+    try:
+        payload = {"jsonrpc":"2.0","id":1,"method":"getBalance","params":[addr]}
+        r = requests.post("https://api.mainnet-beta.solana.com", json=payload, timeout=5)
+        d = r.json()
+        return d.get('result', {}).get('value', 0) / 1e9
+    except:
+        pass
     return 0.0
 
 # ============================================================================
-# STREAMLIT UI
+# SCAN ENGINE
 # ============================================================================
+CHAINS = {
+    'BTC': check_btc,
+    'ETH': check_eth,
+    'BNB': check_bsc,
+    'MATIC': check_polygon,
+    'AVAX': check_avax,
+    'FTM': check_ftm,
+    'ARB': check_arb,
+    'OP': check_op,
+    'BASE': check_base,
+    'TRX': check_trx,
+    'DOGE': check_doge,
+    'LTC': check_ltc,
+    'SOL': check_sol,
+}
 
-st.set_page_config(page_title="BTC Key Hunter", page_icon="₿")
-st.title("₿ Bitcoin Key Hunter")
-st.success(f"{len(BIP39)} canonical BIP-39 words | UTXO Scan Ready")
+def scan_all_chains(eth_addr, btc_addr=None):
+    results = {}
+    
+    if eth_addr:
+        for chain, checker in CHAINS.items():
+            if chain == 'BTC':
+                continue
+            try:
+                bal = checker(eth_addr)
+                if bal > 0:
+                    results[chain] = bal
+                time.sleep(0.05)
+            except:
+                pass
+    
+    if btc_addr:
+        try:
+            bal = check_btc(btc_addr)
+            if bal > 0:
+                results['BTC'] = bal
+        except:
+            pass
+    
+    return results
 
-t1, t2, t3, t4 = st.tabs(["Generate", "Validate", "Weak Patterns", "💀 Deep Scan"])
+# ============================================================================
+# UI
+# ============================================================================
+st.set_page_config(page_title="Multi-Chain Key Hunter", page_icon="💻")
+st.title("💻 Multi-Chain Key Hunter")
+st.success(f"{len(BIP39)} BIP-39 words | 13 Chains: BTC ETH BNB MATIC AVAX FTM ARB OP BASE TRX DOGE LTC SOL")
+
+t1, t2, t3, t4 = st.tabs(["Generate", "Validate", "Brainwallets", "💻 Deep Scan"])
 
 with t1:
     c1, c2 = st.columns(2)
@@ -237,7 +303,6 @@ with t1:
     
     if st.button("Generate", type="primary", use_container_width=True):
         st.session_state['phrases'] = [gen(wc) for _ in range(n)]
-        st.success(f"{n} phrases generated")
     
     if 'phrases' in st.session_state:
         for i, p in enumerate(st.session_state['phrases']):
@@ -258,18 +323,17 @@ with t2:
             elif bad:
                 st.error(f"Unknown: {', '.join(bad)}")
             elif val(p.strip()):
-                st.success("✅ VALID")
+                st.success("✔️ VALID")
             else:
                 st.error("❌ INVALID")
 
 with t3:
-    st.subheader("Weak Pattern Scanner")
-    
     if st.button("Generate + Scan Brainwallets", type="primary", use_container_width=True):
         pws = [
             "password", "12345678", "qwerty123", "letmein", "bitcoin",
             "ethereum", "satoshi", "metamask", "trustwallet", "blockchain",
-            "crypto", "iloveyou", "admin123", "rootroot"
+            "crypto", "iloveyou", "admin123", "rootroot", "passw0rd",
+            "dragon", "monkey", "master", "shadow", "sunshine"
         ]
         
         found_any = False
@@ -278,67 +342,84 @@ with t3:
             h = hashlib.sha256(pw.encode()).digest()
             idxs = [((h[i] << 8) | h[(i+1) % len(h)]) % 2048 for i in range(12)]
             phrase = ' '.join(BIP39[i] for i in idxs)
-            
             s = seed(phrase)
             k = master_key(s)
-            pub = derive_public_key(k)
             
-            if pub:
-                addrs = pubkey_to_addresses(pub)
-                for addr_type, addr in addrs.items():
-                    bal = scan_address_full(addr)
-                    time.sleep(0.3)  # Rate limit
-                    
-                    if bal > 0:
-                        found_any = True
-                        st.success(f"💰 FOUND: {bal:.8f} BTC")
-                        st.code(phrase)
-                        st.text(f"Address ({addr_type}): {addr}")
-                        st.text(f"Private Key: {k.hex()}")
-                    else:
-                        st.text(f"❌ {addr_type}: {addr[:16]}... = 0 BTC")
+            eth_addr = priv_to_eth_address(k)
+            btc_addrs = priv_to_btc_addresses(k)
+            btc_addr = btc_addrs.get('BTC') if btc_addrs else None
+            
+            results = scan_all_chains(eth_addr, btc_addr)
+            
+            if results:
+                found_any = True
+                for chain, bal in results.items():
+                    st.success(f"💰 {chain}: {bal:.6f}")
+                st.code(phrase)
+                st.text(f"ETH: {eth_addr}")
+                if btc_addr:
+                    st.text(f"BTC: {btc_addr}")
+            else:
+                st.text(f"❌ {pw} → 0 on all chains")
+            time.sleep(0.1)
         
         if not found_any:
-            st.warning("No funded wallets found in this batch")
+            st.warning("No funded wallets found")
 
 with t4:
-    st.subheader("💀 Deep UTXO Scan")
-    st.caption("Scans against real UTXO set via multiple APIs")
+    st.subheader("💻 Deep Multi-Chain Scan")
     
-    phrase_input = st.text_area("Enter phrase to deep scan:", height=80, key="deep")
+    phrase_input = st.text_area("Enter phrase:", height=80, key="deep")
     
-    if st.button("💀 Scan Now", type="primary", use_container_width=True):
+    if st.button("💻 Scan All 13 Chains", type="primary", use_container_width=True):
         if phrase_input.strip():
             ws = phrase_input.strip().split()
             
-            if len(ws) not in [12, 24] or not all(w in W2I for w in ws):
+            if not val(phrase_input.strip()):
                 st.error("Invalid phrase")
-            elif not val(phrase_input.strip()):
-                st.error("Invalid checksum")
             else:
                 s = seed(phrase_input.strip())
                 k = master_key(s)
-                pub = derive_public_key(k)
                 
-                if pub:
-                    addrs = pubkey_to_addresses(pub)
+                eth_addr = priv_to_eth_address(k)
+                btc_addrs = priv_to_btc_addresses(k)
+                btc_addr = btc_addrs.get('BTC') if btc_addrs else None
+                
+                st.text(f"Private Key: {k.hex()}")
+                st.text(f"ETH Address: {eth_addr}")
+                if btc_addr:
+                    st.text(f"BTC Address: {btc_addr}")
+                
+                st.markdown("---")
+                
+                progress = st.progress(0)
+                results = {}
+                
+                chains_list = list(CHAINS.items())
+                for i, (chain, checker) in enumerate(chains_list):
+                    addr = btc_addr if chain == 'BTC' else eth_addr
+                    if addr:
+                        try:
+                            bal = checker(addr)
+                            if bal > 0:
+                                results[chain] = bal
+                        except:
+                            pass
+                    progress.progress((i + 1) / len(chains_list))
+                    time.sleep(0.05)
+                
+                progress.empty()
+                
+                if results:
+                    st.success(f"💰 FOUND FUNDS!")
+                    for chain, bal in results.items():
+                        st.metric(chain, f"{bal:.8f}")
+                    st.code(phrase_input.strip())
                     st.text(f"Private Key: {k.hex()}")
-                    
-                    for addr_type, addr in addrs.items():
-                        with st.spinner(f"Scanning {addr_type}: {addr}..."):
-                            bal = scan_address_full(addr)
-                        
-                        col1, col2, col3 = st.columns(3)
-                        col1.metric("Type", addr_type.upper())
-                        col2.metric("Address", f"{addr[:8]}...{addr[-6:]}")
-                        col3.metric("Balance", f"{bal:.8f} BTC" if bal > 0 else "0 BTC")
-                        
-                        if bal > 0:
-                            st.balloons()
-                            st.success(f"💰 FOUND: {bal:.8f} BTC")
-                            st.code(phrase_input.strip())
-                            st.text(f"Private Key: {k.hex()}")
-                            st.text(f"Address: {addr}")
+                else:
+                    st.warning("0 balance on all 13 chains")
+                    for chain in CHAINS:
+                        st.text(f"  ❌ {chain}: 0")
 
 st.markdown("---")
-st.caption("UTXO scanning via Blockstream + Mempool.space + Blockchain.info APIs")
+st.caption("13 Chains: BTC ETH BNB MATIC AVAX FTM ARB OP BASE TRX DOGE LTC SOL")
