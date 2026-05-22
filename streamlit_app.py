@@ -387,9 +387,9 @@ st.caption(f"Canonical BIP-39: {len(BIP39_WORDS)} words | All phrases validated"
 st.markdown("---")
 
 tab1, tab2, tab3, tab4 = st.tabs([
-    "💻 Generate Valid",
+    "🎲 Generate Valid",
     "🔍 Validate Phrase",
-    "🖥 Weak Patterns",
+    "🧠 Weak Patterns",
     "💰 Scan Balances"
 ])
 
@@ -400,7 +400,7 @@ with tab1:
     with c2:
         wc = st.radio("Words", [12, 24], horizontal=True, key="gen_wc")
     
-    if st.button(" Generate", type="primary", use_container_width=True):
+    if st.button("🎲 Generate", type="primary", use_container_width=True):
         phrases = []
         for _ in range(count):
             p = generate_valid_mnemonic(wc)
@@ -411,7 +411,7 @@ with tab1:
     
     if 'gen_phrases' in st.session_state:
         for i, r in enumerate(st.session_state['gen_phrases']):
-            with st.expander(f"{'✔️' if r['valid'] else '❌'} Phrase {i+1}"):
+            with st.expander(f"{'✅' if r['valid'] else '❌'} Phrase {i+1}"):
                 st.code(r['phrase'])
                 if r['valid']:
                     seed = mnemonic_to_seed(r['phrase'])
@@ -421,7 +421,7 @@ with tab1:
 with tab2:
     phrase = st.text_area("Paste mnemonic:", height=80, key="val_input")
     
-    if st.button("✔️ Validate", type="primary", use_container_width=True, key="val_btn"):
+    if st.button("✅ Validate", type="primary", use_container_width=True, key="val_btn"):
         if phrase.strip():
             words = phrase.strip().split()
             bad = [w for w in words if w not in WORD_TO_INDEX]
@@ -433,9 +433,9 @@ with tab2:
             else:
                 valid = validate_mnemonic(phrase.strip())
                 if valid:
-                    st.success("✔️ VALID BIP-39 — Accepted by ALL wallets")
+                    st.success("✅ VALID BIP-39 — Accepted by ALL wallets")
                 else:
-                    st.error("❌️ INVALID checksum — REJECTED by wallets")
+                    st.error("❌ INVALID checksum — REJECTED by wallets")
 
 with tab3:
     st.subheader("Weak Pattern Generators")
@@ -447,7 +447,7 @@ with tab3:
         "All combined"
     ])
     
-    if st.button(" Generate Weak Phrases", type="primary", use_container_width=True):
+    if st.button("🧠 Generate Weak Phrases", type="primary", use_container_width=True):
         phrases = []
         
         if "Brainwallet" in strategy or "All" in strategy:
@@ -463,7 +463,7 @@ with tab3:
     if 'weak_phrases' in st.session_state:
         for i, p in enumerate(st.session_state['weak_phrases'][:30]):
             valid = validate_mnemonic(p)
-            with st.expander(f"{'✔️' if valid else '❌️'} Weak Phrase {i+1}"):
+            with st.expander(f"{'✅' if valid else '❌'} Weak Phrase {i+1}"):
                 st.code(p)
                 if valid:
                     seed = mnemonic_to_seed(p)
